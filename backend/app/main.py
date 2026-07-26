@@ -1,3 +1,4 @@
+﻿import re
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -55,17 +56,52 @@ async def analyze(file: UploadFile = File(...)) -> AnalysisResult:
 
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
-    answer = llm.answer_question(req.question, req.text, req.context_summary)
-    if answer:
-        return AskResponse(answer=answer)
+    text = req.text or ""
+    q = (req.question or "").lower()
 
-    # fallback không có Gemini key
-    q = req.question.lower()
-    text = req.text
-    if "deadline" in q or "hạn" in q:
-        import re
-        m = re.search(r"(?:trước ngày|đến ngày|chậm nhất ngày|hạn cuối ngày)\s*([^\.\n]+)", text, flags=re.I)
+    # Thử dùng Gemini trước, nếu lỗi key/quota thì chuyển fallback
+    try:
+        answer = llm.answer_question(req.question, text, req.context_summary)
+        if answer:
+            return AskResponse(answer=answer)
+    except Exception as e:
+        print(f"[ASK] Gemini error, fallback mode: {e}")
+
+    # Hỏi deadline / thời hạn
+    if "deadline" in q or "hạn" in q or "ngày nào" in q or "thời hạn" in q:
+        m = re.search(
+            r"(trước\s+\d{1,2}\s*giờ(?:\s*\d{1,2}\s*phút)?[,]?\s*ngày\s+\d{1,2}\s+tháng\s+\d{1,2}\s+năm\s+\d{4}|ngày\s+\d{1,2}/\d{1,2}/\d{4}|ngày\s+\d{1,2}\s+tháng\s+\d{1,2}\s+năm\s+\d{4})",
+            text,
+            re.IGNORECASE
+        )
         return AskResponse(answer=m.group(0) if m else "Trong văn bản chưa thấy deadline rõ ràng.")
-    if "tóm tắt" in q or "nói gì" in q:
-        return AskResponse(answer=req.context_summary or text[:700] or "Chưa có nội dung văn bản.")
-    return AskResponse(answer="Bản fallback chưa đủ AI để trả lời sâu. Hãy thêm GEMINI_API_KEY để hỏi đáp tốt hơn.")
+
+    # Hỏi người ký
+    if "ai ký" in q or "người ký" in q or "ký" in q:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        signer = None
+        for line in reversed(lines[-20:]):
+            if len(line.split()) >= 2 and not line.isupper():
+                signer = line
+                break
+        return AskResponse(answer=f"Người ký dự kiến là: {signer}" if signer else "Chưa xác định được người ký trong văn bản.")
+
+    # Hỏi việc cần làm / checklist
+    if "việc cần làm" in q or "cần làm" in q or "checklist" in q or "những việc" in q:
+        tasks = re.findall(r"\d+\.\s+(.+?)(?=\n\d+\.|\n\n|$)", text, re.DOTALL)
+        if tasks:
+            cleaned = [re.sub(r"\s+", " ", t).strip() for t in tasks[:6]]
+            answer = "Các việc cần làm gồm:\n" + "\n".join([f"- {t}" for t in cleaned])
+            return AskResponse(answer=answer)
+        return AskResponse(answer="Văn bản yêu cầu người nhận đọc, xử lý nội dung chính và thực hiện đúng thời hạn.")
+
+    # Hỏi văn bản nói gì / tóm tắt
+    if "nói gì" in q or "tóm tắt" in q or "nội dung" in q:
+        if req.context_summary:
+            return AskResponse(answer=req.context_summary)
+        return AskResponse(answer=text[:700] if text else "Chưa có nội dung văn bản.")
+
+    return AskResponse(
+        answer="Tôi đã nhận câu hỏi. Ở chế độ fallback, tôi có thể trả lời các câu như: văn bản nói gì, deadline là ngày nào, ai là người ký, và những việc cần làm là gì."
+    )
+
