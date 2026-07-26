@@ -1,4 +1,6 @@
 ﻿import re
+import re
+import unicodedata
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -57,51 +59,52 @@ async def analyze(file: UploadFile = File(...)) -> AnalysisResult:
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
     text = req.text or ""
-    q = (req.question or "").lower()
+    question = req.question or ""
+    summary = req.context_summary or ""
 
-    # Thử dùng Gemini trước, nếu lỗi key/quota thì chuyển fallback
+    if not text.strip() and not summary.strip():
+        return AskResponse(answer="Chua co noi dung van ban. Hay upload va phan tich van ban truoc khi hoi dap.")
+
+    # Goi Gemini truoc de hoi dap that su theo noi dung van ban
     try:
-        answer = llm.answer_question(req.question, text, req.context_summary)
-        if answer:
-            return AskResponse(answer=answer)
+        answer = llm.answer_question(question, text, summary)
+        if answer and str(answer).strip():
+            return AskResponse(answer=str(answer).strip())
     except Exception as e:
-        print(f"[ASK] Gemini error, fallback mode: {e}")
+        print(f"[ASK] Gemini error, using fallback: {repr(e)}")
 
-    # Hỏi deadline / thời hạn
-    if "deadline" in q or "hạn" in q or "ngày nào" in q or "thời hạn" in q:
+    # Fallback chi dung khi Gemini loi quota/key/mang
+    import unicodedata as _ud
+
+    def plain(s: str) -> str:
+        s = _ud.normalize("NFD", s or "")
+        s = "".join(ch for ch in s if _ud.category(ch) != "Mn")
+        return s.replace("đ", "d").replace("Đ", "D").lower()
+
+    q = plain(question)
+
+    if "deadline" in q or "han" in q or "ngay nao" in q or "thoi han" in q:
         m = re.search(
-            r"(trước\s+\d{1,2}\s*giờ(?:\s*\d{1,2}\s*phút)?[,]?\s*ngày\s+\d{1,2}\s+tháng\s+\d{1,2}\s+năm\s+\d{4}|ngày\s+\d{1,2}/\d{1,2}/\d{4}|ngày\s+\d{1,2}\s+tháng\s+\d{1,2}\s+năm\s+\d{4})",
-            text,
+            r"(truoc\s+\d{1,2}\s*gio(?:\s*\d{1,2}\s*phut)?[,]?\s*ngay\s+\d{1,2}\s+thang\s+\d{1,2}\s+nam\s+\d{4}|ngay\s+\d{1,2}/\d{1,2}/\d{4})",
+            plain(text),
             re.IGNORECASE
         )
-        return AskResponse(answer=m.group(0) if m else "Trong văn bản chưa thấy deadline rõ ràng.")
+        return AskResponse(answer=m.group(0) if m else "Fallback: chua thay deadline ro rang trong van ban.")
 
-    # Hỏi người ký
-    if "ai ký" in q or "người ký" in q or "ký" in q:
+    if "ai ky" in q or "nguoi ky" in q:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
-        signer = None
-        for line in reversed(lines[-20:]):
-            if len(line.split()) >= 2 and not line.isupper():
-                signer = line
-                break
-        return AskResponse(answer=f"Người ký dự kiến là: {signer}" if signer else "Chưa xác định được người ký trong văn bản.")
+        signer = lines[-1] if lines else ""
+        return AskResponse(answer=f"Fallback: nguoi ky du kien la {signer}" if signer else "Fallback: chua xac dinh duoc nguoi ky.")
 
-    # Hỏi việc cần làm / checklist
-    if "việc cần làm" in q or "cần làm" in q or "checklist" in q or "những việc" in q:
+    if "viec can lam" in q or "can lam" in q or "checklist" in q or "nhung viec" in q:
         tasks = re.findall(r"\d+\.\s+(.+?)(?=\n\d+\.|\n\n|$)", text, re.DOTALL)
         if tasks:
             cleaned = [re.sub(r"\s+", " ", t).strip() for t in tasks[:6]]
-            answer = "Các việc cần làm gồm:\n" + "\n".join([f"- {t}" for t in cleaned])
-            return AskResponse(answer=answer)
-        return AskResponse(answer="Văn bản yêu cầu người nhận đọc, xử lý nội dung chính và thực hiện đúng thời hạn.")
+            return AskResponse(answer="Fallback - cac viec can lam:\n" + "\n".join([f"- {t}" for t in cleaned]))
+        return AskResponse(answer="Fallback: van ban yeu cau nguoi nhan doc, xu ly noi dung chinh va thuc hien dung thoi han.")
 
-    # Hỏi văn bản nói gì / tóm tắt
-    if "nói gì" in q or "tóm tắt" in q or "nội dung" in q:
-        if req.context_summary:
-            return AskResponse(answer=req.context_summary)
-        return AskResponse(answer=text[:700] if text else "Chưa có nội dung văn bản.")
+    if "noi gi" in q or "tom tat" in q or "noi dung" in q or "van ban" in q:
+        return AskResponse(answer=summary if summary else text[:700])
 
-    return AskResponse(
-        answer="Tôi đã nhận câu hỏi. Ở chế độ fallback, tôi có thể trả lời các câu như: văn bản nói gì, deadline là ngày nào, ai là người ký, và những việc cần làm là gì."
-    )
+    return AskResponse(answer=summary if summary else "Fallback: da nhan cau hoi, nhung Gemini dang loi nen chi tra loi co ban theo noi dung van ban.")
 
